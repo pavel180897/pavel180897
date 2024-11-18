@@ -1,3 +1,15 @@
+import os
+import threading
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 5000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
+    server.serve_forever()
+
+# Запускаем сервер в отдельном потоке
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import re
