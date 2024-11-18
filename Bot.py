@@ -347,8 +347,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     try:
-        # Инициализация бота
-        application = Application.builder().token(BOT_TOKEN).build()
+        # Инициализация бота с правильными таймаутами
+        application = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .get_updates_read_timeout(30)
+            .get_updates_write_timeout(30)
+            .get_updates_connection_pool_size(100)
+            .build()
+        )
 
         # Добавляем проверку здоровья каждые 5 минут
         application.job_queue.run_repeating(health_check, interval=300)
@@ -384,10 +391,7 @@ async def main():
                 logger.info("Bot started successfully")
                 await application.run_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                    timeout=30,
-                    read_timeout=30,
-                    write_timeout=30
+                    drop_pending_updates=True
                 )
             except NetworkError as e:
                 logger.error(f"Network error occurred: {e}")
@@ -405,7 +409,10 @@ async def main():
                 logger.error(f"Unexpected error occurred: {e}")
                 await asyncio.sleep(10)
             finally:
-                await application.stop()
+                try:
+                    await application.stop()
+                except Exception as e:
+                    logger.error(f"Error stopping application: {e}")
 
     except Exception as e:
         logger.error(f"Fatal error occurred: {e}")
