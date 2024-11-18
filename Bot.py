@@ -358,7 +358,10 @@ async def main():
         )
 
         # Добавляем проверку здоровья каждые 5 минут
-        application.job_queue.run_repeating(health_check, interval=300)
+        try:
+            application.job_queue.run_repeating(health_check, interval=300)
+        except Exception as e:
+            logger.warning(f"Could not setup health check: {e}")
 
         # Добавление обработчиков с таймаутом
         conv_handler = ConversationHandler(
@@ -383,44 +386,53 @@ async def main():
 
         application.add_handler(conv_handler)
 
-        # Запуск бота с улучшенной обработкой ошибок
-        while True:
-            try:
-                await application.initialize()
-                await application.start()
-                logger.info("Bot started successfully")
-                await application.run_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True
-                )
-            except NetworkError as e:
-                logger.error(f"Network error occurred: {e}")
-                await asyncio.sleep(1)
-            except TimedOut as e:
-                logger.error(f"Timeout error occurred: {e}")
-                await asyncio.sleep(2)
-            except RetryAfter as e:
-                logger.error(f"Rate limit error occurred: {e}")
-                await asyncio.sleep(e.retry_after)
-            except TelegramError as e:
-                logger.error(f"Telegram error occurred: {e}")
-                await asyncio.sleep(5)
-            except Exception as e:
-                logger.error(f"Unexpected error occurred: {e}")
-                await asyncio.sleep(10)
-            finally:
+        try:
+            # Запускаем бота
+            await application.initialize()
+            await application.start()
+            logger.info("Bot started successfully")
+            
+            # Запускаем polling в бесконечном цикле
+            while True:
                 try:
-                    await application.stop()
+                    await application.run_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=True
+                    )
+                except NetworkError as e:
+                    logger.error(f"Network error occurred: {e}")
+                    await asyncio.sleep(1)
+                except TimedOut as e:
+                    logger.error(f"Timeout error occurred: {e}")
+                    await asyncio.sleep(2)
+                except RetryAfter as e:
+                    logger.error(f"Rate limit error occurred: {e}")
+                    await asyncio.sleep(e.retry_after)
+                except TelegramError as e:
+                    logger.error(f"Telegram error occurred: {e}")
+                    await asyncio.sleep(5)
                 except Exception as e:
-                    logger.error(f"Error stopping application: {e}")
+                    logger.error(f"Unexpected error occurred: {e}")
+                    await asyncio.sleep(10)
+        except Exception as e:
+            logger.error(f"Fatal error occurred: {e}")
+        finally:
+            try:
+                await application.stop()
+            except Exception as e:
+                logger.error(f"Error stopping application: {e}")
 
     except Exception as e:
         logger.error(f"Fatal error occurred: {e}")
 
-if __name__ == '__main__':
+def run_bot():
+    """Запускает бота с правильной обработкой event loop"""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error in main loop: {e}")
+
+if __name__ == '__main__':
+    run_bot()
