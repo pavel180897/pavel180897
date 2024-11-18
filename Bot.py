@@ -1,19 +1,27 @@
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram.error import NetworkError, TelegramError, TimedOut, RetryAfter
+import re
+from datetime import datetime
+import logging
+import asyncio
+import json
 import os
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from functools import wraps
+import time
 
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 5000))
-    server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
-    server.serve_forever()
-
-# Запускаем сервер в отдельном потоке
-threading.Thread(target=run_dummy_server, daemon=True).start()
-
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-import re
-from datetime import datetime
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Токен бота
 BOT_TOKEN = '7642974557:AAFQCBKKQFf6rTwz4aAe0v9l5cmccZyIvSo'
@@ -21,6 +29,11 @@ BOT_TOKEN = '7642974557:AAFQCBKKQFf6rTwz4aAe0v9l5cmccZyIvSo'
 ADMIN_ID = '385474644'
 # ID консультанта
 CONSULTANT_ID = '385474644'
+
+# Настройки повторных попыток
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+CONVERSATION_TIMEOUT = 300  # 5 минут
 
 # Состояния разговора
 (
@@ -55,7 +68,84 @@ def get_back_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
+# Функция для сохранения состояния
+def save_state(user_id, state_data):
+    try:
+        os.makedirs('states', exist_ok=True)
+        with open(f'states/{user_id}.json', 'w') as f:
+            json.dump(state_data, f)
+    except Exception as e:
+        logger.error(f"Error saving state: {e}")
+
+# Функция для загрузки состояния
+def load_state(user_id):
+    try:
+        with open(f'states/{user_id}.json', 'r') as f:
+            return json.load(f)
+    except:
+        return None
+
+# Декоратор для повторных попыток
+def retry_on_error(max_retries=MAX_RETRIES, delay=RETRY_DELAY):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            for i in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except (NetworkError, TimedOut) as e:
+                    if i == max_retries - 1:
+                        logger.error(f"Failed after {max_retries} retries: {e}")
+                        raise
+                    logger.warning(f"Retry {i + 1}/{max_retries} after error: {e}")
+                    await asyncio.sleep(delay * (i + 1))
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                except Exception as e:
+                    logger.error(f"Unexpected error: {e}")
+                    raise
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# Функция мониторинга здоровья
+async def health_check(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # Проверяем подключение к Telegram
+        await context.bot.get_me()
+        logger.info("Health check passed")
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        # Уведомляем администратора
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"❗️ Проблема с ботом: {e}"
+            )
+        except:
+            pass
+
+# Запуск HTTP сервера для render.com
+def run_dummy_server():
+    try:
+        port = int(os.environ.get("PORT", 5000))
+        server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
+        logger.info(f"Starting HTTP server on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Error starting HTTP server: {e}")
+
+# Запускаем сервер в отдельном потоке
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
+@retry_on_error()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Загружаем сохраненное состояние
+    user_id = str(update.effective_user.id)
+    saved_state = load_state(user_id)
+    if saved_state:
+        context.user_data.update(saved_state)
+    
     welcome_text = (
         f"👋 Добро пожаловать, {update.message.from_user.first_name}!\n\n"
         "🛍 С нами вы можете зарегистрироваться в Клубном Интернет Магазине Атоми "
@@ -70,6 +160,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, reply_markup=get_start_keyboard())
     return ConversationHandler.END
 
+@retry_on_error()
 async def consultation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Администратор получил ваше сообщение и скоро свяжется с вами.")
     await context.bot.send_message(
@@ -78,6 +169,7 @@ async def consultation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+@retry_on_error()
 async def register_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Выберите тип регистрации:",
@@ -85,6 +177,7 @@ async def register_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return CHOOSING_REGISTRATION_TYPE
 
+@retry_on_error()
 async def registration_type_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     context.user_data['is_distributor'] = text == "Дистрибьютор"
@@ -95,12 +188,14 @@ async def registration_type_chosen(update: Update, context: ContextTypes.DEFAULT
     return FULLNAME
 
 # Добавим функцию проверки отмены регистрации
+@retry_on_error()
 async def check_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "Отменить регистрацию":
         await cancel(update, context)
         return True
     return False
 
+@retry_on_error()
 async def fullname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_cancel(update, context):
         return ConversationHandler.END
@@ -111,6 +206,7 @@ async def fullname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return BIRTHDATE
 
+@retry_on_error()
 async def birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_cancel(update, context):
         return ConversationHandler.END
@@ -128,8 +224,8 @@ async def birthdate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_back_keyboard()
         )
         return BIRTHDATE
-      
 
+@retry_on_error()
 async def address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_cancel(update, context):
         return ConversationHandler.END
@@ -140,6 +236,7 @@ async def address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return PHONE
 
+@retry_on_error()
 async def phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_cancel(update, context):
         return ConversationHandler.END
@@ -156,6 +253,7 @@ async def phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return EMAIL
 
+@retry_on_error()
 async def email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_cancel(update, context):
         return ConversationHandler.END
@@ -172,6 +270,7 @@ async def email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return SOURCE
 
+@retry_on_error()
 async def source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_cancel(update, context):
         return ConversationHandler.END
@@ -185,6 +284,7 @@ async def source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return await finish_registration(update, context)
 
+@retry_on_error()
 async def inn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_cancel(update, context):
         return ConversationHandler.END
@@ -197,6 +297,7 @@ async def inn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['inn'] = update.message.text
     return await finish_registration(update, context)
 
+@retry_on_error()
 async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = context.user_data
     user = update.message.from_user
@@ -235,6 +336,7 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear()
     return ConversationHandler.END
 
+@retry_on_error()
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Регистрация отменена.",
@@ -242,46 +344,76 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     context.user_data.clear()
     return ConversationHandler.END
-  
 
-def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+async def main():
+    try:
+        # Инициализация бота
+        application = Application.builder().token(BOT_TOKEN).build()
 
-    # Обработчики
-    application.add_handler(CommandHandler("start", start))
-    
-    application.add_handler(MessageHandler(
-        filters.Regex(pattern=r'^Получить консультацию$'),
-        consultation
-    ))
-    
-    registration_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(pattern=r'^Зарегистрироваться$'), register_choice)],
-        states={
-            CHOOSING_REGISTRATION_TYPE: [
-                MessageHandler(filters.Regex(pattern=r'^(Покупатель|Дистрибьютор)$'), registration_type_chosen)
+        # Добавляем проверку здоровья каждые 5 минут
+        application.job_queue.run_repeating(health_check, interval=300)
+
+        # Добавление обработчиков с таймаутом
+        conv_handler = ConversationHandler(
+            entry_points=[
+                CommandHandler('start', start),
+                MessageHandler(filters.Regex('^Получить консультацию$'), consultation),
+                MessageHandler(filters.Regex('^Зарегистрироваться$'), register_choice),
             ],
-            FULLNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, fullname)],
-            BIRTHDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, birthdate)],
-            ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone)],
-            EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, email)],
-            SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, source)],
-            INN: [MessageHandler(filters.TEXT & ~filters.COMMAND, inn)],
-        },
-        fallbacks=[
-            CommandHandler('cancel', cancel),
-            MessageHandler(filters.Regex(pattern=r'^Отменить регистрацию$'), cancel)
-        ],
-    )
-    
-    application.add_handler(registration_handler)
-    
-    # Добавляем обработчик для любых других сообщений
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
-    
-    print("Бот запущен...")
-    application.run_polling(drop_pending_updates=True)
+            states={
+                CHOOSING_REGISTRATION_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, registration_type_chosen)],
+                FULLNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, fullname)],
+                BIRTHDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, birthdate)],
+                ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, address)],
+                PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone)],
+                EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, email)],
+                SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, source)],
+                INN: [MessageHandler(filters.TEXT & ~filters.COMMAND, inn)],
+            },
+            fallbacks=[MessageHandler(filters.Regex('^Отменить регистрацию$'), cancel)],
+            conversation_timeout=CONVERSATION_TIMEOUT
+        )
+
+        application.add_handler(conv_handler)
+
+        # Запуск бота с улучшенной обработкой ошибок
+        while True:
+            try:
+                await application.initialize()
+                await application.start()
+                logger.info("Bot started successfully")
+                await application.run_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                    timeout=30,
+                    read_timeout=30,
+                    write_timeout=30
+                )
+            except NetworkError as e:
+                logger.error(f"Network error occurred: {e}")
+                await asyncio.sleep(1)
+            except TimedOut as e:
+                logger.error(f"Timeout error occurred: {e}")
+                await asyncio.sleep(2)
+            except RetryAfter as e:
+                logger.error(f"Rate limit error occurred: {e}")
+                await asyncio.sleep(e.retry_after)
+            except TelegramError as e:
+                logger.error(f"Telegram error occurred: {e}")
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Unexpected error occurred: {e}")
+                await asyncio.sleep(10)
+            finally:
+                await application.stop()
+
+    except Exception as e:
+        logger.error(f"Fatal error occurred: {e}")
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error in main loop: {e}")
